@@ -1,0 +1,36 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    container_name: modular_store_db
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password123
+      POSTGRES_DB: modular_store
+    ports:
+      - "5432:5432"
+
+  monolith:
+    build:
+      context: ./ModularStore.Api
+      dockerfile: Dockerfile
+    container_name: modular_store_monolith
+    depends_on:
+      - postgres
+    environment:
+      ConnectionStrings__DefaultConnection: Host=postgres;Database=modular_store;Username=admin;Password=password123
+    ports:
+      - "8080:8080"
+
+  orders-service:
+    build:
+      context: ./Orders.Service/Orders.Api
+      dockerfile: Dockerfile
+    container_name: orders_service
+    depends_on:
+      - postgres
+      - monolith
+    environment:
+      ConnectionStrings__DefaultConnection: Host=postgres;Database=modular_store;Username=admin;Password=password123
+      Services__ProductsUrl: http://monolith:8080
+    ports:
+      - "8081:8080"
