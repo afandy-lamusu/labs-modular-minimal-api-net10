@@ -1,59 +1,122 @@
 using System.IdentityModel.Tokens.Jwt;
 using System.Security.Claims;
 using System.Text;
-using Microsoft.EntityFrameworkCore;
+using Microsoft.AspNetCore.Identity;
 using Microsoft.IdentityModel.Tokens;
-using ModularStore.Api.Modules.Users.Infrastructure;
 
 namespace ModularStore.Api.Modules.Users.Application;
 
-public record LoginRequest(string Email, string Password);
-public record TokenResponse(string Token);
-
 public class UserService
 {
-    private readonly UsersDbContext _context;
-    private readonly IConfiguration _configuration;
+    private readonly UserManager<IdentityUser> _userManager;
+    private readonly RoleManager<IdentityRole> _roleManager;
+    private readonly IConfiguration _config;
 
-    public UserService(UsersDbContext context, IConfiguration configuration)
+    public UserService(
+        UserManager<IdentityUser> userManager,
+        RoleManager<IdentityRole> roleManager,
+        IConfiguration config)
     {
-        _context = context;
-        _configuration = configuration;
+        _userManager = userManager;
+        _roleManager = roleManager;
+        _config = config;
     }
 
-    public async Task<TokenResponse?> AuthenticateAsync(LoginRequest request, CancellationToken ct)
+    // ── Register ──────────────────────────────────────────
+    public async Task<(bool Success, IEnumerable<string> Errors)>
+        RegisterAsync(RegisterRequest request)
     {
-        var user = await _context.Users.FirstOrDefaultAsync(u => u.Email == request.Email, ct);
-        
-        // ⚠ In a real app, use BCrypt or similar to verify PasswordHash
-        // For this ebook example, we simplify login logic:
-        if (user == null || request.Password != "password123") return null;
-
-        var token = GenerateJwt(user);
-        return new TokenResponse(token);
-    }
-
-    private string GenerateJwt(Domain.User user)
-    {
-        var jwtKey = _configuration["JWT_SECRET"] ?? "DEVELOPMENT_ONLY_KEY_32_CHARS_LONG!!!";
-        var key = Encoding.ASCII.GetBytes(jwtKey);
-
-        var tokenHandler = new JwtSecurityTokenHandler();
-        var tokenDescriptor = new SecurityTokenDescriptor
+        var user = new IdentityUser
         {
-            Subject = new ClaimsIdentity(new[]
-            {
-                new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
-                new Claim(ClaimTypes.Email, user.Email),
-                new Claim(ClaimTypes.Role, user.Role)
-            }),
-            Expires = DateTime.UtcNow.AddHours(2),
-            Issuer = _configuration["Jwt:Issuer"],
-            Audience = _configuration["Jwt:Audience"],
-            SigningCredentials = new SigningCredentials(new SymmetricSecurityKey(key), SecurityAlgorithms.HmacSha256Signature)
+            UserName = request.Email,
+            Email    = request.Email
         };
 
-        var token = tokenHandler.CreateToken(tokenDescriptor);
-        return tokenHandler.WriteToken(token);
+        // Identity handles password hashing — we just pass the plain text
+        var result = await _userManager.CreateAsync(user, request.Password);
+
+        if (!result.Succeeded)
+            return (false, result.Errors.Select(e => e.Description));
+
+        // Assign default role on registration
+        await EnsureRoleExistsAsync("Customer");
+        await _userManager.AddToRoleAsync(user, "Customer");
+
+        return (true, []);
+    }
+
+    // ── Login ─────────────────────────────────────────────
+    public async Task<LoginResponse?> LoginAsync(LoginRequest request)
+    {
+        var user = await _userManager.FindByEmailAsync(request.Email);
+        if (user == null) return null;
+
+        // Identity checks the password hash — never compare plain text
+        var isValid = await _userManager.CheckPasswordAsync(
+            user, request.Password);
+        if (!isValid) return null;
+
+        // Check if account is locked out
+        if (await _userManager.IsLockedOutAsync(user)) return null;
+
+        var roles   = await _userManager.GetRolesAsync(user);
+        var role    = roles.FirstOrDefault() ?? "Customer";
+        var expiry  = DateTime.UtcNow.AddMinutes(
+            _config.GetValue<int>("Jwt:TokenExpiryMinutes", 60));
+        var token   = GenerateToken(user, roles, expiry);
+
+        return new LoginResponse(token, user.Email!, role, expiry);
+    }
+
+    // ── Assign Role ───────────────────────────────────────
+    public async Task<bool> AssignRoleAsync(string email, string role)
+    {
+        var user = await _userManager.FindByEmailAsync(email);
+        if (user == null) return false;
+
+        await EnsureRoleExistsAsync(role);
+        var result = await _userManager.AddToRoleAsync(user, role);
+        return result.Succeeded;
+    }
+
+    // ── JWT Generation ────────────────────────────────────
+    private string GenerateToken(
+        IdentityUser user,
+        IList<string> roles,
+        DateTime expiry)
+    {
+        var jwtKey = _config["JWT_SECRET"]
+                     ?? "DEVELOPMENT_ONLY_KEY_MINIMUM_32_CHARS!!";
+
+        var key         = new SymmetricSecurityKey(
+                              Encoding.UTF8.GetBytes(jwtKey));
+        var credentials = new SigningCredentials(
+                              key, SecurityAlgorithms.HmacSha256);
+
+        var claims = new List<Claim>
+        {
+            new(JwtRegisteredClaimNames.Sub,   user.Id),
+            new(JwtRegisteredClaimNames.Email, user.Email!),
+            new(JwtRegisteredClaimNames.Jti,   Guid.NewGuid().ToString()),
+        };
+
+        // Add each role as a separate claim
+        claims.AddRange(roles.Select(r => new Claim(ClaimTypes.Role, r)));
+
+        var token = new JwtSecurityToken(
+            issuer:             _config["Jwt:Issuer"],
+            audience:           _config["Jwt:Audience"],
+            claims:             claims,
+            expires:            expiry,
+            signingCredentials: credentials
+        );
+
+        return new JwtSecurityTokenHandler().WriteToken(token);
+    }
+
+    private async Task EnsureRoleExistsAsync(string role)
+    {
+        if (!await _roleManager.RoleExistsAsync(role))
+            await _roleManager.CreateAsync(new IdentityRole(role));
     }
 }
